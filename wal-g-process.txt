@@ -1,0 +1,94 @@
+#Installing wal-g
+wget https://github.com/wal-g/wal-g/releases/download/v1.1/wal-g-pg-ubuntu-20.04-amd64.tar.gz
+tar xvf wal-g-pg-ubuntu-20.04-amd64.tar.gz
+mv wal-g-pg-ubuntu-20.04-amd64 /usr/local/bin/wal-g
+
+#WAL-G environment variables
+mkdir -p /etc/wal-g.d/env/
+echo "/tmp/account.json" > /etc/wal-g.d/env/GOOGLE_APPLICATION_CREDENTIALS
+echo "gs://wal_g_bucket_170422/wal-g" > /etc/wal-g.d/env/WALG_GS_PREFIX
+chown -R root.postgres /etc/wal-g.d/
+
+#Switching current WAL
+select pg_switch_wal();
+
+#Current WAL
+SELECT pg_walfile_name(pg_current_wal_lsn());
+
+#Current timeline
+SELECT timeline_id FROM pg_control_checkpoint();
+
+#Activating service account that will upload files to GCS
+gcloud auth activate-service-account --key-file=/tmp/account.json
+
+#Archive command to upload WAL to GCS in /etc/postgresql/13/main/postgresql.conf
+archive_command = 'envdir /etc/wal-g.d/env /usr/local/bin/wal-g wal-push %p'
+
+#Restore options to recover WAL from GCS in /etc/postgresql/13/main/postgresql.conf
+restore_command = 'envdir /etc/wal-g.d/env/ /usr/local/bin/wal-g wal-fetch %f %p >> /tmp/wal-g_$(date +%Y%m%d).log 2>&1'
+recovery_target_time = '2022-04-17 19:32:00 UTC'
+
+#wal-g data directory backup command
+export PGHOST=/var/run/postgresql
+envdir /etc/wal-g.d/env/ /usr/local/bin/wal-g backup-push /var/lib/postgresql/13/main
+
+#In order to recover
+
+1. Stop postgresql service
+
+sudo systemctl stop postgresql@13-main
+
+2. Remove data directory
+
+sudo rm -rf /var/lib/postgresql/13/main/*
+
+3. Download most recent backup from GCS
+
+envdir /etc/wal-g.d/env wal-g backup-fetch /var/lib/postgresql/13/main LATEST
+
+4. Create recovery file in data directory (postgres)
+
+touch /var/lib/postgresql/13/main/recovery.signal
+
+5. Add recovery options in /etc/postgresql/13/main/postgresql.conf
+
+restore_command = 'envdir /etc/wal-g.d/env/ /usr/local/bin/wal-g wal-fetch %f %p >> /tmp/wal-g_$(date +%Y%m%d).log'
+recovery_target_time = '2022-04-17 19:32:00 UTC' #In case of PITR
+
+6. Start postgresql service
+
+sudo systemctl start postgresql@13-main
+
+7. Wait until recovery and follow the log files
+
+sudo tail -f /tmp/wal-g_$(date +%Y%m%d).log 
+PGDATA/log
+
+8. In case of PITR, execute the following to create a new timeline (postgres)
+select pg_wal_replay_resume();
+
+#File-based replication
+
+1. Stop postgresql service
+
+sudo systemctl stop postgresql@13-main
+
+2. Remove data directory
+
+sudo rm -rf /var/lib/postgresql/13/main/*
+
+3. Download most recent backup from GCS (postgres)
+
+envdir /etc/wal-g.d/env wal-g backup-fetch /var/lib/postgresql/13/main
+
+4. Create recovery and standby files in data directory (postgres)
+
+touch /var/lib/postgresql/13/main/recovery.signal /var/lib/postgresql/13/main/standby.signal
+
+5. Add recovery options in /etc/postgresql/13/main/postgresql.conf
+
+restore_command = 'envdir /etc/wal-g.d/env/ /usr/local/bin/wal-g wal-fetch %f %p >> /tmp/wal-g_$(date +%Y%m%d).log 2>&1'
+
+6. Start postgresql service
+
+sudo systemctl start postgresql@13-main
